@@ -1358,6 +1358,12 @@ class SemiLagrangian(uw_object):
         :meth:`update_forcing_history` (direct nodal evaluation of
         ``forcing_fn`` — typically the constitutive model's strain-rate
         symbol).
+    traceback_evalf : bool, optional
+        Force upstream history sampling through the numerical evaluator
+        path in ``uw.function.global_evaluate``. The default is ``True``
+        for tensor history variables and ``False`` otherwise. This avoids
+        a partition-sensitive MPI collective mismatch in the FE evaluator
+        path for tensor stress history traceback.
     theta : float, default=0.5
         Adams-Moulton θ for the implicit flux integrator at order 1.
         The order-1 AM coefficients are ``[θ, 1-θ]``:
@@ -1406,6 +1412,7 @@ class SemiLagrangian(uw_object):
         preserve_moments=False,
         with_forcing_history: bool = False,
         monotone_mode: Optional[str] = None,
+        traceback_evalf: Optional[bool] = None,
         theta: float = 0.5,
     ):
         super().__init__()
@@ -1434,6 +1441,9 @@ class SemiLagrangian(uw_object):
         # Settable after construction:
         #   ``adv_diff.DuDt.monotone_mode = "clamp"``
         self.monotone_mode = monotone_mode
+        if traceback_evalf is None:
+            traceback_evalf = vtype in (uw.VarType.SYM_TENSOR, uw.VarType.TENSOR)
+        self.traceback_evalf = bool(traceback_evalf)
         # Adams-Moulton θ for the implicit flux at order 1.
         # The order-1 AM coefficients are ``[θ, 1-θ]``:
         #   θ=0.5  → Crank-Nicolson (A-stable, 2nd order accuracy on
@@ -1986,6 +1996,7 @@ class SemiLagrangian(uw_object):
         """
 
         self._dt = dt
+        traceback_evalf = bool(evalf or self.traceback_evalf)
 
         # Resolve monotone_mode: explicit kwarg overrides instance attr.
         if monotone_mode == "__instance__":
@@ -2334,12 +2345,44 @@ class SemiLagrangian(uw_object):
             # option (uw.function.global_evaluate), so any resampling
             # path can request the same bounded result. monotone_mode is
             # None in the default trajectory → no-op (bit-identical).
-            value_at_end_points = uw.function.global_evaluate(
-                expr_to_evaluate,
-                end_pt_coords,
-                evalf=evalf,
-                monotone=monotone_mode,
-            )
+            if (
+                getattr(self, "_psi_star_use_multicomponent", False)
+                and hasattr(expr_to_evaluate, "shape")
+                and expr_to_evaluate.shape != (1, 1)
+            ):
+                # Tensor stress history traceback uses evalf=True by default.
+                # The FE evaluator path (evalf=False) currently has a
+                # partition-sensitive MPI collective mismatch for tensor
+                # history samples in some upstream-point layouts.  Component
+                # evaluation also keeps each collective scalar-shaped.
+                #
+                # TODO: root-fix uw.function.global_evaluate(..., evalf=False)
+                # for tensor-valued history traceback, then consider reverting
+                # the tensor default to the FE evaluator.
+                rows, cols = expr_to_evaluate.shape
+                n_points = end_pt_coords.shape[0]
+                value_at_end_points = np.empty((n_points, rows, cols), dtype=float)
+                for row in range(rows):
+                    for col in range(cols):
+                        comp_value = uw.function.global_evaluate(
+                            expr_to_evaluate[row, col],
+                            end_pt_coords,
+                            evalf=traceback_evalf,
+                            monotone=monotone_mode,
+                        )
+                        comp_array = np.asarray(comp_value)
+                        if comp_array.ndim == 3:
+                            comp_array = comp_array[:, 0, 0]
+                        elif comp_array.ndim == 2 and comp_array.shape[1] == 1:
+                            comp_array = comp_array[:, 0]
+                        value_at_end_points[:, row, col] = comp_array.reshape(n_points)
+            else:
+                value_at_end_points = uw.function.global_evaluate(
+                    expr_to_evaluate,
+                    end_pt_coords,
+                    evalf=traceback_evalf,
+                    monotone=monotone_mode,
+                )
 
             # CRITICAL FIX (2025-11-27): If psi_star has units, ensure the assigned
             # value also has units. global_evaluate may return plain arrays.
