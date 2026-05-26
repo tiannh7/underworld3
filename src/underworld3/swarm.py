@@ -4519,7 +4519,7 @@ class Swarm(Stateful, uw_object):
 
         delta_t_model = uw.scaling.non_dimensionalise(delta_t)
 
-        dt_limit = self.estimate_dt(V_fn)
+        dt_limit = self.estimate_dt(V_fn) if step_limit else None
 
         if step_limit and dt_limit is not None:
             substeps = int(max(1, round(abs(delta_t_model) / dt_limit)))
@@ -4527,7 +4527,10 @@ class Swarm(Stateful, uw_object):
             substeps = 1
 
         if uw.mpi.rank == 0 and self.verbose:
-            print(f"Substepping {substeps} / {abs(delta_t) / dt_limit}, {delta_t} ")
+            if dt_limit is not None:
+                print(f"Substepping {substeps} / {abs(delta_t) / dt_limit}, {delta_t} ")
+            else:
+                print(f"Substepping {substeps}, {delta_t} ")
 
         # X0 holds the particle location at the start of advection
         # This is needed because the particles may be migrated off-proc
