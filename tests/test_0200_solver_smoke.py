@@ -147,6 +147,51 @@ class TestMeshSmoke:
 class TestSwarmSmoke:
     """Quick swarm tests."""
 
+    def test_swarm_advection_skips_dt_estimate_without_step_limit(self, monkeypatch):
+        """Verify unrestricted advection does not estimate a swarm timestep."""
+        import underworld3 as uw
+
+        mesh = uw.meshing.StructuredQuadBox(elementRes=(4, 4))
+        v = uw.discretisation.MeshVariable("v", mesh, mesh.dim, degree=2)
+
+        with uw.synchronised_array_update():
+            v.array[:, 0, 0] = 0.1
+            v.array[:, 0, 1] = 0.0
+
+        swarm = uw.swarm.Swarm(mesh)
+        swarm.populate(fill_param=1)
+
+        def fail_estimate_dt(self, V_fn):
+            raise AssertionError("estimate_dt should not be called when step_limit=False")
+
+        monkeypatch.setattr(uw.swarm.Swarm, "estimate_dt", fail_estimate_dt)
+        swarm.advection(v.sym, delta_t=0.01, order=1, step_limit=False)
+
+    def test_swarm_advection_uses_dt_estimate_with_step_limit(self, monkeypatch):
+        """Verify CFL-limited advection still estimates a swarm timestep."""
+        import underworld3 as uw
+
+        mesh = uw.meshing.StructuredQuadBox(elementRes=(4, 4))
+        v = uw.discretisation.MeshVariable("v", mesh, mesh.dim, degree=2)
+
+        with uw.synchronised_array_update():
+            v.array[:, 0, 0] = 0.1
+            v.array[:, 0, 1] = 0.0
+
+        swarm = uw.swarm.Swarm(mesh)
+        swarm.populate(fill_param=1)
+
+        calls = {"count": 0}
+
+        def estimate_dt(self, V_fn):
+            calls["count"] += 1
+            return 1.0
+
+        monkeypatch.setattr(uw.swarm.Swarm, "estimate_dt", estimate_dt)
+        swarm.advection(v.sym, delta_t=0.01, order=1, step_limit=True)
+
+        assert calls["count"] == 1
+
     def test_swarm_creation_and_advection(self):
         """Verify swarm can be created and advected."""
         import underworld3 as uw
