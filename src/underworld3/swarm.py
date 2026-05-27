@@ -24,6 +24,7 @@ underworld3.systems.ddt : Time derivative schemes using swarms.
 """
 from posixpath import pardir
 import petsc4py.PETSc as PETSc
+from mpi4py import MPI
 
 import numpy as np
 import sympy
@@ -4539,6 +4540,50 @@ class Swarm(Stateful, uw_object):
         X0 = self._X0
 
         V_fn_matrix = self.mesh.vector.to_matrix(V_fn)
+        summarise_advection = bool(self.verbose)
+
+        def _global_particle_count():
+            if not summarise_advection:
+                return None
+            local_n = int(self.local_size)
+            total_n = comm.allreduce(local_n, op=MPI.SUM)
+            min_n = comm.allreduce(local_n, op=MPI.MIN)
+            max_n = comm.allreduce(local_n, op=MPI.MAX)
+            return local_n, total_n, min_n, max_n
+
+        def _global_max_speed(values):
+            if not summarise_advection:
+                return None
+            if values.size == 0:
+                local_max = 0.0
+            else:
+                local_max = float(np.linalg.norm(values, axis=1).max())
+            return comm.allreduce(local_max, op=MPI.MAX)
+
+        def _print_advection_summary(
+            step,
+            scheme,
+            particles_before,
+            particles_after,
+            speed_max,
+            stages,
+        ):
+            if not summarise_advection or uw.mpi.rank != 0:
+                return
+            _, total_before, min_before, max_before = particles_before
+            _, total_after, min_after, max_after = particles_after
+            migration_delta = total_after - total_before
+            stage_text = ", ".join(stages)
+            print(
+                "Swarm advection "
+                f"({scheme}, substep {step + 1}/{substeps}): "
+                f"particles global {total_before}->{total_after} "
+                f"(local min/max {min_before}/{max_before}->{min_after}/{max_after}, "
+                f"delta {migration_delta:+d}); "
+                f"max |V|={speed_max:.6e}; "
+                f"{stage_text}",
+                flush=True,
+            )
 
         # Use current velocity to estimate where the particles would have
         # landed in an implicit step. WE CANT DO THIS WITH SUB-STEPPING unless
@@ -4584,14 +4629,15 @@ class Swarm(Stateful, uw_object):
         for step in range(0, substeps):
 
             X0.array[:, 0, :] = self._particle_coordinates.data[...]
+            particles_before = _global_particle_count()
 
             # Mid point algorithm (2nd order)
 
             if order == 2:
-                print(f"Advection (2nd): {self.local_size} - swarm points", flush=True)
 
                 # Use internal model-unit coordinates directly (no conversion needed)
                 v_at_Vpts = np.zeros_like(self._particle_coordinates.data[...])
+                stages = ["velocity local-eval", "midpoint global-interp"]
 
                 # First evaluate the velocity at the particle locations
                 # (this is a local operation)
@@ -4608,20 +4654,34 @@ class Swarm(Stateful, uw_object):
                 # This will re-position particles in periodic domains (etc)
                 if self.mesh.return_coords_to_bounds is not None:
                     mid_pt_coords = self.mesh.return_coords_to_bounds(mid_pt_coords)
+                    stages.append("bounds-correct midpoint")
 
                 # Now do a **Global** evaluation
                 # (since the mid-points might have moved off-proc)
                 #
 
                 v_at_Vpts[...] = uw.function.global_evaluate(V_fn_matrix, mid_pt_coords)[:, 0, :]
+                speed_max = _global_max_speed(v_at_Vpts)
 
                 new_coords = X0.array[:, 0, :] + delta_t_model * v_at_Vpts / substeps
 
                 if self.mesh.return_coords_to_bounds is not None:
                     new_coords = self.mesh.return_coords_to_bounds(new_coords)
+                    stages.append("bounds-correct final")
 
                 # Set the new particle positions (and automatically migrate)
                 self._particle_coordinates.data[...] = new_coords[...]
+                particles_after = _global_particle_count()
+                stages.append("coordinate update/migrate")
+
+                _print_advection_summary(
+                    step,
+                    "2nd-order midpoint",
+                    particles_before,
+                    particles_after,
+                    speed_max,
+                    stages,
+                )
 
                 del new_coords
                 del v_at_Vpts
@@ -4629,30 +4689,30 @@ class Swarm(Stateful, uw_object):
             # forward Euler (1st order)
             else:
                 coords = self._particle_coordinates.data
-                print(
-                    f"1. Advection (1st): {coords.shape} v {self.local_size} - swarm point shape",
-                    flush=True,
-                )
+                stages = ["velocity global-interp"]
 
                 v_at_Vpts = np.zeros_like(coords)
                 v_at_Vpts[...] = uw.function.global_evaluate(V_fn_matrix, coords[...])[:, 0, :]
-
-                print(
-                    f"2. Advection (1st): {coords.shape} v {self.local_size} - swarm point shape",
-                    flush=True,
-                )
+                speed_max = _global_max_speed(v_at_Vpts)
 
                 new_coords = coords[...] + delta_t_model * v_at_Vpts / substeps
 
-                print(
-                    f"3. Advection (1st): {coords.shape} v {self.local_size} - swarm point shape",
-                    flush=True,
-                )
-
                 if self.mesh.return_coords_to_bounds is not None:
                     new_coords = self.mesh.return_coords_to_bounds(new_coords)
+                    stages.append("bounds-correct final")
 
                 self._particle_coordinates.data[...] = new_coords[...]
+                particles_after = _global_particle_count()
+                stages.append("coordinate update/migrate")
+
+                _print_advection_summary(
+                    step,
+                    "1st-order Euler",
+                    particles_before,
+                    particles_after,
+                    speed_max,
+                    stages,
+                )
 
         ## End of substepping loop
 
